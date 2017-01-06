@@ -7,11 +7,7 @@ import websockets
 import asyncio
 import sys
 import re
-from asyncio import Queue, CancelledError
-if sys.version_info < (3, 5):
-    from asyncio import async as ensure_future
-else:
-    from asyncio import ensure_future
+from asyncio import ensure_future
 from collections import deque
 
 from functools import partial
@@ -495,8 +491,9 @@ class Broker:
         wait_deliver.cancel()
 
         self.logger.debug("%s Client disconnected" % client_session.client_id)
+        self.logger.critical("%s Client disconnected" % client_session.client_id)
         server.release_connection()
-
+        self.delete_session(client_session.client_id)
 
     def _init_handler(self, session, reader, writer):
         """
@@ -565,70 +562,76 @@ class Broker:
                 del self._retained_messages[topic_name]
 
     def add_subscription(self, subscription, session):
-        import re
-        wildcard_pattern = re.compile('.*?/?\+/?.*?')
         try:
-            a_filter = subscription[0]
-            if '#' in a_filter and not a_filter.endswith('#'):
-                # [MQTT-4.7.1-2] Wildcard character '#' is only allowed as last character in filter
-                return 0x80
-            if a_filter != "+":
-                if '+' in a_filter:
-                    if "/+" not in a_filter and "+/" not in a_filter:
-                        # [MQTT-4.7.1-3] + wildcard character must occupy entire level
-                        return 0x80
-
+            topic = subscription[0]
             qos = subscription[1]
-            if 'max-qos' in self.config and qos > self.config['max-qos']:
-                qos = self.config['max-qos']
-            if a_filter not in self._subscriptions:
-                self._subscriptions[a_filter] = []
-            already_subscribed = next(
-                (s for (s,qos) in self._subscriptions[a_filter] if s.client_id == session.client_id), None)
-            if not already_subscribed:
-                self._subscriptions[a_filter].append((session, qos))
-            else:
-                self.logger.debug("Client %s has already subscribed to %s" % (format_client_message(session=session), a_filter))
-            return qos
         except KeyError:
             return 0x80
 
-    def _del_subscription(self, a_filter, session):
-        """
-        Delete a session subscription on a given topic
-        :param a_filter:
-        :param session:
-        :return:
-        """
-        deleted = 0
+        # Shared subscriptions
+        group = None
+        shared_match = re.search(r'^\$share:(?P<group>\w+):(?P<topic>.+)$', topic)
+        if shared_match:
+            group = shared_match.group('group')
+            topic = shared_match.group('topic')
+
+        # Wildcard character '#' is only allowed as last character in topic
+        if '#' in topic and not topic.endswith('#'):
+            return 0x80
+        # Wildcard character '+' must occupy entire level
+        if topic != '+' and '+' in topic:
+            if "/+" not in topic and "+/" not in topic:
+                return 0x80
+
+        if 'max-qos' in self.config and qos > self.config['max-qos']:
+            qos = self.config['max-qos']
+        if topic not in self._subscriptions:
+            sub = {group: {'sessions': []}}
+            if group is not None:
+                sub[group]['index'] = 0
+            self._subscriptions[topic] = sub
+
+        for group_info in self._subscriptions[topic].values():
+            for s, _ in group_info['sessions']:
+                if s.client_id == session.client_id:
+                    log.debug(
+                        'Client %s has already subscribed to %s',
+                        format_client_message(session=session), topic
+                    )
+                    return qos
+
+        self._subscriptions[topic][group]['sessions'].append((session, qos))
+        return qos
+
+    def _del_subscription(self, topic, session):
+        # Shared subscriptions
+        group = None
+        shared_match = re.search(r'^\$share:(?P<group>\w+):(?P<topic>.+)$', topic)
+        if shared_match:
+            group = shared_match.group('group')
+            topic = shared_match.group('topic')
+
         try:
-            subscriptions = self._subscriptions[a_filter]
-            for index, (sub_session, qos) in enumerate(subscriptions):
-                if sub_session.client_id == session.client_id:
-                    self.logger.debug("Removing subscription on topic '%s' for client %s" %
-                                      (a_filter, format_client_message(session=session)))
-                    subscriptions.pop(index)
-                    deleted += 1
-                    break
+            sessions = self._subscriptions[topic][group]['sessions']
         except KeyError:
-            # Unsubscribe topic not found in current subscribed topics
-            pass
-        finally:
-            return deleted
+            return
+
+        for index, (sub_session, qos) in enumerate(sessions):
+            if sub_session.client_id == session.client_id:
+                sessions.pop(index)
+
+        # Free memory
+        if not self._subscriptions[topic][group]['sessions']:
+            self.logger.critical('deleting group %s', group)
+            del self._subscriptions[topic][group]
+        if not self._subscriptions[topic]:
+            self.logger.critical('deleting topic %s', topic)
+            del self._subscriptions[topic]
 
     def _del_all_subscriptions(self, session):
-        """
-        Delete all topic subscriptions for a given session
-        :param session:
-        :return:
-        """
-        filter_queue = deque()
-        for topic in self._subscriptions:
-            if self._del_subscription(topic, session):
-                filter_queue.append(topic)
-        for topic in filter_queue:
-            if not self._subscriptions[topic]:
-                del self._subscriptions[topic]
+        self.logger.critical('subs: %s', self._subscriptions.keys())
+        for topic in list(self._subscriptions.keys()):
+            self._del_subscription(topic, session)
 
     def matches(self, topic, a_filter):
         if "#" not in a_filter and "+" not in a_filter:
@@ -639,44 +642,60 @@ class Broker:
             match_pattern = re.compile(a_filter.replace('#', '.*').replace('$', '\$').replace('+', '[/\$\s\w\d]+'))
             return match_pattern.match(topic)
 
-    @asyncio.coroutine
-    def _broadcast_loop(self):
-        running_tasks = deque()
+    async def _broadcast_loop(self):
+        running_tasks = []
+
+        def clear(future, task):
+            try:
+                running_tasks.remove(task)
+            except KeyError:
+                pass
+
         try:
             while True:
-                while running_tasks and running_tasks[0].done():
-                    running_tasks.popleft()
-                broadcast = yield from self._broadcast_queue.get()
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug("broadcasting %r" % broadcast)
-                for k_filter in self._subscriptions:
-                    if broadcast['topic'].startswith("$") and (k_filter.startswith("+") or k_filter.startswith("#")):
-                        self.logger.debug("[MQTT-4.7.2-1] - ignoring brodcasting $ topic to subscriptions starting with + or #")
-                    elif self.matches(broadcast['topic'], k_filter):
-                        subscriptions = self._subscriptions[k_filter]
-                        for (target_session, qos) in subscriptions:
+                broadcast = await self._broadcast_queue.get()
+                for topic in self._subscriptions:
+                    if broadcast['topic'].startswith('$') and (topic.startswith('+') or topic.startswith('#')):
+                        log.debug('ignoring brodcasting $ topic to subscriptions starting with + or #')
+                    elif not self.matches(broadcast['topic'], topic):
+                        continue
+                    groups = self._subscriptions[topic]
+                    for group, group_info in groups.items():
+                        sessions = group_info['sessions']
+                        if group is not None:
+                            if group_info['index'] >= len(sessions):
+                                group_info['index'] = 0
+                            sessions = [group_info['sessions'][group_info['index']]]
+                            group_info['index'] += 1
+                        for target_session, qos in sessions:
                             if 'qos' in broadcast:
                                 qos = broadcast['qos']
                             if target_session.transitions.state == 'connected':
-                                self.logger.debug("broadcasting application message from %s on topic '%s' to %s" %
-                                                  (format_client_message(session=broadcast['session']),
-                                                   broadcast['topic'], format_client_message(session=target_session)))
                                 handler = self._get_handler(target_session)
-                                task = ensure_future(
-                                    handler.mqtt_publish(broadcast['topic'], broadcast['data'], qos, retain=False),
-                                    loop=self._loop)
+                                task = asyncio.ensure_future(
+                                    handler.mqtt_publish(
+                                        broadcast['topic'],
+                                        broadcast['data'],
+                                        qos,
+                                        retain=False
+                                    ), loop=self._loop
+                                )
+                                task.add_done_callback(partial(clear, task))
                                 running_tasks.append(task)
                             else:
-                                self.logger.debug("retaining application message from %s on topic '%s' to client '%s'" %
-                                                  (format_client_message(session=broadcast['session']),
-                                                   broadcast['topic'], format_client_message(session=target_session)))
                                 retained_message = RetainedApplicationMessage(
-                                    broadcast['session'], broadcast['topic'], broadcast['data'], qos)
-                                yield from target_session.retained_messages.put(retained_message)
-        except CancelledError:
+                                    broadcast['session'],
+                                    broadcast['topic'],
+                                    broadcast['data'],
+                                    qos
+                                )
+                                await target_session.retained_messages.put(retained_message)
+        except asyncio.CancelledError:
             # Wait until current broadcasting tasks end
             if running_tasks:
-                yield from asyncio.wait(running_tasks, loop=self._loop)
+                await asyncio.wait(running_tasks, loop=self._loop)
+        except Exception as exc:
+            log.exception(exc)
 
     @asyncio.coroutine
     def _broadcast_message(self, session, topic, data, force_qos=None):
@@ -729,6 +748,7 @@ class Broker:
         :param client_id:
         :return:
         """
+        self.logger.critical('tchao %s' % client_id)
         try:
             session = self._sessions[client_id][0]
         except KeyError:
